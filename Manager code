@@ -1,0 +1,1803 @@
+---------------------------------------------------
+--- SubVehicle Shield Manager
+--- Author: Louis-A.A 
+--- Description:
+---  This script is made to be plug and play. It manages the position of held subvehicles (ON TURRETS) to protect the construct.
+---------------------------------------------------
+
+------------------------------------------------------
+--- NOTES AND INSTRUCTIONS
+------------------------------------------------------
+--- GENERAL SETUP
+------------------------------------------------------
+---
+---The script will crash if there are empty holders on turrets on INIT. avoid this.
+---
+---The program has an INIT phase that allows you to build, change or add/remove drones. 
+---This in turn requires saving and reloading the vehicle afterwards.
+---
+--- This script controls subvehicles mounted on turrets
+--- (component type 7) to create a defensive drone shield.
+---
+--- Drones are positioned between the construct and incoming
+--- threats. The wall is dynamically regenerated every update
+--- cycle, allowing drones to react to changing targets and
+--- missile threats.
+---
+--- The script is designed to be plug-and-play, but proper
+--- turret placement is important for optimal performance.
+------------------------------------------------------
+
+-----------------------------------------------------
+---DRONE REQUIREMENTS
+-----------------------------------------------------
+-- the drone does not require an AI
+-- the drone can be any size or shape
+
+--ALL HOLDERS ON TURRETS MUST HAVE A DRONE
+
+------------------------------------------------------
+--- HOLDER / TURRET CONFIGURATION
+------------------------------------------------------
+--- 1) DO NOT USE ROLL IN HOLDER SETTINGS.
+---    Roll cannot be accessed or modified through Lua.
+---    Only azimuth and elevation are controlled.
+---
+--- 2) Place drone holders close to the center of mass (COM)
+---    of the construct.
+---
+---    Good placement:
+---      - Spread around the COM
+---      - Similar distance from the center
+---      - Clear line of movement
+---
+---    Bad placement:
+---      - Holders located on extreme ends of the craft
+---      - Holders blocked by armor or other subobjects
+--- 
+--- 3) it gets expotentionally more computationaly expensive the more drones you have, 
+--- so try to keep it reasonable yeah?
+--- 
+---
+--- The wall position is calculated using the furthest holder
+--- from the threat direction. This ensures the shield remains
+--- flat and prevents drones from forming a curved surface.
+------------------------------------------------------
+
+------------------------------------------------------
+--- WEAPON PLACEMENT
+------------------------------------------------------
+--- Avoid placing weapons directly around drone holders.
+---
+--- The script automatically creates firing holes in the
+--- drone wall to allow weapons to shoot through.
+---
+--- Weapons very close to holders may create large permanent
+--- gaps in the shield and reduce protection.
+---
+--- For best results:
+---   - Place offensive weapons away from shield holders
+---   - Leave clear firing lanes
+---   - Use dedicated shield areas on the craft
+------------------------------------------------------
+function Update(I) 
+------------------------------------------------------
+---PARAMETERS
+------------------------------------------------------
+--- Adjust these values to customize the shield behavior.
+------------------------------------------------------
+
+
+------------------------------------------------------
+--- TARGET GROUPING
+------------------------------------------------------
+--- Controls when multiple enemies are considered part
+--- of the same threat direction.
+---
+--- Higher value = fewer walls, less chance of overlap
+--- Lower value = more separate walls, better coverage
+---
+--- Value is a cosine angle:
+--- 0.95 ≈ 18 degrees
+--- 0.87 ≈ 30 degrees
+------------------------------------------------------
+
+TargetGroupingAngle = 0.95
+
+
+
+------------------------------------------------------
+--- SHIELD WALL SHAPE
+------------------------------------------------------
+--- Controls the number and spacing of drones in each wall.
+--- Increase rows/columns for a larger shield surface.
+--- MAY CAUSE AN ERROR IF THE AMOUNT OF SLOTS (ROWS*COLUMNS) IS INFERIOR TO THE NUMBER OF DRONES
+------------------------------------------------------
+
+--- Computationally intensive. Keep values low while rows*columns > # of drones
+GridRows = 3
+GridColumns = 6
+
+--- Distance between drones in the wall
+DroneGap = 5
+--- Size of the holes created to allow weapons to fire
+FiringlaneSize = 2
+
+
+------------------------------------------------------
+--- SHIELD WALL POSITION
+------------------------------------------------------
+--- Maximum distance between the drone holders and the wall.
+--- Higher values create a larger separation from the craft.
+--- This also keeps the wall flat by using the furthest holder.
+------------------------------------------------------
+
+MaxHolderDistance = 100
+
+
+
+------------------------------------------------------
+--- MISSILE INTERCEPTION
+------------------------------------------------------
+--- Controls emergency drone interception behavior.
+------------------------------------------------------
+
+--- Maximum distance at which missiles can be intercepted
+MissileInterceptRange = 300
+
+--- Ignore missiles closer than this distance
+--- (prevents wasting drones on missiles already too close)
+MissileMinimumInterceptRange = 75
+
+--- Maximum fraction of drones allowed to leave the wall
+--- Example:
+--- 0.25 = 25% of drones can intercept missiles
+MissileDroneFraction = 0.25
+
+
+
+------------------------------------------------------
+--- DRONE PRIORITY
+------------------------------------------------------
+--- Controls which drones receive the central positions
+--- of the shield wall.
+---
+--- Type:
+---     "size" = sort by drone dimensions
+---     "name" = sort alphabetically by blueprint name
+---
+--- Order:
+---     "ascending" = smallest/first drones in center
+---     "descending" = largest/first drones in center
+------------------------------------------------------
+
+DroneSortType = "size"
+DroneSortOrder = "descending"
+
+
+
+------------------------------------------------------
+--- ADVANCED WALL COLLISION SETTINGS
+------------------------------------------------------
+--- These values are normally left unchanged.
+--- They control the safety margin when placing drones.
+------------------------------------------------------
+
+HorizontalFactor = 1
+VerticalFactor = 1
+
+WallRadius = 2
+
+
+
+------------------------------------------------------
+--- FALLBACK DRONE DIMENSIONS
+------------------------------------------------------
+--- Used only if drone size cannot be detected.
+--- Normally these values are never used.
+------------------------------------------------------
+
+Defaultheight = 6
+Defaultwidth = 11
+-------------------------------------------------------
+-- FUNCTIONS
+-------------------------------------------------------
+
+function CheckDroneCollision(
+    PositionA,
+    RadiusA,
+    PositionB,
+    RadiusB
+)
+
+    local RequiredDistance =
+        RadiusA + RadiusB
+
+
+    return DistanceSquared(
+        PositionA,
+        PositionB
+    )
+    <
+    RequiredDistance * RequiredDistance
+
+end
+
+function FindSafeDronePosition(
+    OriginalPosition,
+    TargetIndex,
+    HolderID,
+    OccupiedDronePositions,
+    PlaneRight,
+    PlaneUp
+)
+
+    local Radius =
+        GetDroneCollisionRadius(
+            HolderID
+        )
+
+
+    local SearchDistance = 
+        Radius * 2 + DroneGap
+
+
+    local SearchOffsets =
+    {
+        {x= SearchDistance, y=0},
+        {x=-SearchDistance, y=0},
+        {x=0, y= SearchDistance},
+        {x=0, y=-SearchDistance},
+
+        {x= SearchDistance, y= SearchDistance},
+        {x=-SearchDistance, y= SearchDistance},
+        {x= SearchDistance, y=-SearchDistance},
+        {x=-SearchDistance, y=-SearchDistance}
+    }
+
+
+    for i=1,#SearchOffsets do
+
+        local Offset =
+            SearchOffsets[i]
+
+
+        local TestPosition =
+            OriginalPosition
+            +
+            PlaneRight * Offset.x
+            +
+            PlaneUp * Offset.y
+
+
+        local Collision = false
+
+
+        for j=1,#OccupiedDronePositions do
+
+            local Other =
+                OccupiedDronePositions[j]
+
+
+            if CheckDroneCollision(
+                TestPosition,
+                Radius,
+                Other.Position,
+                Other.Radius
+            )
+            then
+
+                Collision = true
+                break
+
+            end
+
+        end
+
+
+        if Collision == false then
+
+            return TestPosition
+
+        end
+
+    end
+
+
+    return nil
+
+end
+
+function GetDroneCollisionRadius(HolderID)
+
+    local Size =
+        DroneSizeTable[HolderID]
+
+    if Size then
+
+        return math.sqrt(
+            Size.width * Size.width +
+            Size.height * Size.height
+        ) / 2
+
+    end
+
+    return 5
+
+end
+
+function DistanceSquared(A, B)
+
+    local dx = A.x - B.x
+    local dy = A.y - B.y
+    local dz = A.z - B.z
+
+    return dx*dx + dy*dy + dz*dz
+
+end
+
+function SortHolders(Holders, HolderInfo, SortType, SortOrder)
+
+    table.sort(
+        Holders,
+        function(a,b)
+
+            local ValueA
+            local ValueB
+
+
+            -- SELECT SORT CRITERIA
+            if SortType == "size" then
+
+                ValueA =
+                    HolderInfo[a].width *
+                    HolderInfo[a].height
+
+                ValueB =
+                    HolderInfo[b].width *
+                    HolderInfo[b].height
+
+
+            elseif SortType == "name" then
+
+                ValueA =
+                    HolderInfo[a].name or ""
+
+                ValueB =
+                    HolderInfo[b].name or ""
+
+            end
+
+
+            -- SELECT SORT DIRECTION
+            if SortOrder == "ascending" then
+
+                return ValueA < ValueB
+
+            else
+
+                return ValueA > ValueB
+
+            end
+
+        end
+    )
+
+end
+
+function NormalizeVector(Vector)
+
+    local Length =
+        math.sqrt(
+            Vector.x^2 +
+            Vector.y^2 +
+            Vector.z^2
+        )
+
+    if Length == 0 then
+        return Vector3(0,0,0)
+    end
+
+    return Vector3(
+        Vector.x / Length,
+        Vector.y / Length,
+        Vector.z / Length
+    )
+
+end
+
+function VectorDot(A, B)
+
+    return 
+        A.x * B.x +
+        A.y * B.y +
+        A.z * B.z
+
+end
+
+function VectorCross(A, B)
+
+    return Vector3(
+        A.y * B.z - A.z * B.y,
+        A.z * B.x - A.x * B.z,
+        A.x * B.y - A.y * B.x
+    )
+
+end
+
+function RayPlaneIntersection(RayOrigin, RayDirection, PlaneCenter, PlaneNormal)
+
+    local Dot = VectorDot(RayDirection, PlaneNormal)
+
+    if math.abs(Dot) < 0.001 then
+        return nil
+    end
+
+    local Difference = PlaneCenter - RayOrigin
+
+    local Distance =
+        VectorDot(Difference, PlaneNormal)
+        /
+        Dot
+
+    return RayOrigin + RayDirection * Distance
+
+end
+
+function WorldToPlane(Position, Center, Right, Up)
+
+    local Offset = Position - Center
+
+    return {
+        x = VectorDot(Offset, Right),
+        y = VectorDot(Offset, Up)
+    }
+
+end
+
+function IsInvalidPosition(
+    x,
+    y,
+    width,
+    height,
+    InvalidPositions
+)
+
+    for i=1,#InvalidPositions do
+
+        local Hole =
+            InvalidPositions[i]
+
+
+        if math.abs(x-Hole.x)
+            <
+            (width+Hole.width)/2
+
+        and
+
+        math.abs(y-Hole.y)
+            <
+            (height+Hole.height)/2
+
+        then
+
+            return true
+
+        end
+
+    end
+
+
+    return false
+
+end
+
+function IsOverlapping(x,y,width,height,Placed)
+
+    for i=1,#Placed do
+
+        local Other = Placed[i]
+
+        if math.abs(x-Other.x) <
+        (width+Other.width)/2*HorizontalFactor
+
+        and
+
+        math.abs(y-Other.y) <
+        (height+Other.height)/2*VerticalFactor
+
+        then
+            return true
+        end
+
+    end
+
+    return false
+
+end
+
+-------------------------------------------------------
+-- INITIALIZATION
+-------------------------------------------------------
+
+if Init == nil then
+    Init = false
+end
+
+if not Init then
+
+    -------------------------------------------------------
+    -- DATA COLLECTION AND ORGANIZATION
+    -------------------------------------------------------
+-- getting the number of holders from the game API
+    HolderCount = I:Component_GetCount(7)
+
+    WeaponCount = I:GetWeaponCount()
+
+    InitHolderInfoTable = {}
+
+    for i=0,HolderCount-1 do
+-- get the block info for the holder from the game API
+        local holderblockinfo =  I:Component_GetBlockInfo(7, i)
+
+        local selectedVehicleID =  I:Component_GetIntLogic(7, i)
+
+        local holdDistance = I:Component_GetFloatLogic(7, i)
+
+        local holdAzimuth = I:Component_GetFloatLogic_1(7, i, 1)
+
+        local holdElevation = I:Component_GetFloatLogic_1(7, i, 2)
+
+        local SubConstructIdentifier = holderblockinfo.SubConstructIdentifier
+
+        if I:IsTurret(SubConstructIdentifier) == true then
+
+                        local subconstructinfo = I:GetSubConstructInfo(SubConstructIdentifier)
+                -- subconstructinfo contains .LocalPosition, .LocalPositionRelativeToCOM, .Forwards, .LocalForwards, .LocalRotation, .CustomName
+            local subvehicleinfo = I:GetFriendlyInfoById(selectedVehicleID) -- friendly info by ID
+            
+
+            WeaponData = nil
+            WeaponIndex = nil
+
+            local ConstructPosition = I:GetConstructPosition()
+            local ConstructForward = I:GetConstructForwardVector()
+            local ConstructUp = I:GetConstructUpVector()
+            local ConstructRight = I:GetConstructRightVector()
+
+            local SubPosition = subconstructinfo.LocalPosition
+
+            local SubGlobalPosition = ConstructPosition
+                + (ConstructForward * SubPosition.z)
+                + (ConstructUp * SubPosition.y)
+                + (ConstructRight * SubPosition.x)
+        
+            for ii = 0, WeaponCount - 1 do
+
+                local tempWeaponInfo = I:GetWeaponInfo(ii)
+
+                local WeaponPosition = tempWeaponInfo.GlobalPosition
+
+                local Difference = WeaponPosition - SubGlobalPosition
+
+                local Distance =
+                    math.sqrt(
+                        Difference.x * Difference.x +
+                        Difference.y * Difference.y +
+                        Difference.z * Difference.z
+                    )
+
+                if Distance < 0.5 then
+
+                    WeaponData = tempWeaponInfo
+                    WeaponIndex = ii
+                    break
+
+                end
+            end
+
+            InitHolderInfoTable[i] = {
+
+                blockinfo = holderblockinfo,
+
+                selectedVehicleID =
+                    selectedVehicleID,
+
+                holdDistance =
+                    holdDistance,
+
+                holdAzimuth =
+                    holdAzimuth,
+
+                holdElevation =
+                    holdElevation,
+
+                subconstructinfo =
+                    subconstructinfo,
+
+                subconstructId =
+                    SubConstructIdentifier,
+
+                subvehicleinfo =
+                    subvehicleinfo,
+
+                weaponData =
+                    WeaponData,
+
+                weaponIndex =
+                    WeaponIndex,
+
+                invalid = false
+                }
+        
+        else    
+                
+            InitHolderInfoTable[i] = {
+                invalid = true
+            }
+        end
+        
+
+    end
+
+    -- create a table to hold all valid holders IDs
+    ValidHolders = {}
+
+    for i=0, HolderCount-1 do
+        if InitHolderInfoTable[i].invalid == false then
+            table.insert(ValidHolders, i)
+        end
+    end
+
+    ValidHoldersCount = #ValidHolders
+
+    -- regroup all holder weaponInfo to get firelanes
+    HWIgroup = {}
+    for i=1, #ValidHolders do
+        table.insert(HWIgroup, InitHolderInfoTable[ValidHolders[i]].weaponIndex)
+    end
+
+Init = true
+
+end
+
+-------------------------------------------------------
+-- LIVE HOLDER DATA
+-------------------------------------------------------
+
+local PreviousSummaryHolderInfoTable = SummaryHolderInfoTable or {}
+SummaryHolderInfoTable = {}
+
+for i=0,HolderCount-1 do
+
+     local holderblockinfo =  I:Component_GetBlockInfo(7,i)
+
+    local selectedVehicleID =  I:Component_GetIntLogic(7,i)
+
+    local SubConstructIdentifier = holderblockinfo.SubConstructIdentifier
+
+    local subconstructinfo = I:GetSubConstructInfo(SubConstructIdentifier)
+        -- subconstructinfo contains .LocalPosition, .LocalPositionRelativeToCOM, .Forwards, .LocalForwards, .LocalRotation, .CustomName
+    local subvehicleinfo = I:GetFriendlyInfoById(selectedVehicleID) -- friendly info by ID
+        
+    local WeaponData = I:GetWeaponInfo(InitHolderInfoTable[i].weaponIndex)
+
+    SummaryHolderInfoTable[i] = {
+
+        blockinfo = holderblockinfo,
+
+        subconstructinfo =
+            subconstructinfo,
+
+        subvehicleinfo =
+            subvehicleinfo,
+
+        weaponData =
+            WeaponData,
+            
+        invalid = false
+            }
+            
+end
+
+
+---------------------------------------
+---FIRELANES
+---------------------------------------
+
+FireLanes = {}
+for i=0, WeaponCount-1 do
+    --exclude holder turrets from firelanes using HWIgroup
+    ValidTurret = true
+    for ii=1, #HWIgroup do
+        if i == HWIgroup[ii] then
+            ValidTurret = false
+            break
+        end
+    end
+    if ValidTurret == true then
+        local FLweaponData = I:GetWeaponInfo(i)
+        if FLweaponData.valid == true then
+        table.insert(FireLanes, FLweaponData)
+        end
+
+    end
+
+end
+
+-------------------------------------------------------
+-- TARGET TRACKING
+-------------------------------------------------------
+
+TargetInfoTable = {}
+
+TargetCount = I:GetNumberOfTargets(0)
+ValidTargets = 0
+
+for i = 0, TargetCount-1 do
+
+    local targetInfo = I:GetTargetInfo(0, i)
+    
+    
+    if targetInfo.valid == true then
+        TargetInfoTable[i] = targetInfo
+        ValidTargets = ValidTargets + 1
+    end
+
+end
+
+TargetGroups = {}
+
+local constructPosition =
+    I:GetConstructPosition()
+
+
+for i=0,TargetCount-1 do
+
+    local Target = TargetInfoTable[i]
+
+    if Target then
+
+        local Direction =
+            NormalizeVector(
+                Target.Position - constructPosition
+            )
+
+
+        local Added = false
+
+
+        for g=1,#TargetGroups do
+
+            local Group =
+                TargetGroups[g]
+
+
+            local Dot =
+                VectorDot(
+                    Direction,
+                    Group.Direction
+                )
+
+
+            if Dot > TargetGroupingAngle then
+
+                table.insert(
+                    Group.Targets,
+                    Target
+                )
+
+                Group.Direction =
+                    NormalizeVector(
+                        Group.Direction + Direction
+                    )
+
+                Added = true
+                break
+
+            end
+
+        end
+
+
+        if Added == false then
+
+            table.insert(
+                TargetGroups,
+                {
+                    Direction = Direction,
+                    Targets = {Target}
+                }
+            )
+
+        end
+
+    end
+
+end
+
+for i=1,#TargetGroups do
+
+    local TotalGroupScore = 0
+
+    for j=1,#TargetGroups[i].Targets do
+
+        TotalGroupScore =
+            TotalGroupScore
+            +
+            TargetGroups[i].Targets[j].Score
+
+    end
+
+    TargetGroups[i].Score =
+        TotalGroupScore
+
+
+    -- calculate average position
+
+    local AveragePosition =
+        Vector3(0,0,0)
+
+
+    for j=1,#TargetGroups[i].Targets do
+
+        AveragePosition =
+            AveragePosition
+            +
+            TargetGroups[i].Targets[j].Position
+
+    end
+
+
+    AveragePosition =
+        AveragePosition
+        /
+        #TargetGroups[i].Targets
+
+
+    TargetGroups[i].Position =
+        AveragePosition
+
+end
+
+-------------------------------------------------------
+-- TARGET PRIORITY ASSIGNMENT
+-------------------------------------------------------
+
+TotalScore = 0
+AssignedHolderTotal = 0
+TargetMetaTable = {}
+AssignedHolders = {}
+
+for i = 1, #TargetGroups do
+
+    local Group = TargetGroups[i]
+
+    if Group then
+
+        TotalScore =
+            TotalScore
+            +
+            Group.Score
+
+    end
+
+end
+
+if #TargetGroups > 0 then
+
+    for i = 1, #TargetGroups do
+
+        TargetMetaTable[i] = {}
+
+        local Group = TargetGroups[i]
+
+        if Group then
+
+            local targetScore =
+                Group.Score
+
+            local numHoldersForTarget =
+                math.floor(
+                    (targetScore / TotalScore)
+                    *
+                    ValidHoldersCount
+                )
+
+
+            TargetMetaTable[i].numHoldersAssigned =
+                numHoldersForTarget
+
+
+            AssignedHolderTotal =
+                AssignedHolderTotal
+                +
+                numHoldersForTarget
+            
+
+        end
+
+    end
+
+    -- If no holders were assigned by scoring, distribute evenly across all targets
+    if AssignedHolderTotal == 0 
+    and ValidHoldersCount > 0 
+    and #TargetGroups > 0 then
+
+        local holdersPerTarget =
+            math.floor(
+                ValidHoldersCount / #TargetGroups
+            )
+
+        local remainder =
+            ValidHoldersCount % #TargetGroups
+            
+        for i = 1, #TargetGroups do
+            local numHoldersForTarget = holdersPerTarget
+            if i <= remainder then
+                numHoldersForTarget = numHoldersForTarget + 1
+            end
+            TargetMetaTable[i].numHoldersAssigned = math.max(0,numHoldersForTarget)
+            AssignedHolderTotal = AssignedHolderTotal + numHoldersForTarget
+        end
+    end
+
+    -- if holders remain unassigned, distribute them to the first target
+    if AssignedHolderTotal < ValidHoldersCount then
+        TargetMetaTable[1].numHoldersAssigned = TargetMetaTable[1].numHoldersAssigned + (ValidHoldersCount - AssignedHolderTotal)
+    end
+
+    local HolderCursor = 1
+
+    for i=1,#TargetGroups do
+
+        AssignedHolders[i] = {}
+
+        local Amount =
+            TargetMetaTable[i].numHoldersAssigned
+
+
+        for j=1,Amount do
+
+            if HolderCursor <= ValidHoldersCount then
+
+                table.insert(
+                    AssignedHolders[i],
+                    ValidHolders[HolderCursor]
+                )
+
+                HolderCursor = HolderCursor + 1
+
+            end
+
+        end
+
+    end
+
+end
+
+-------------------------------------------------------
+-- DRONE SIZE
+-------------------------------------------------------
+-- default drone size if no valid drone is found
+
+DroneSizeTable = {}
+
+for i=1, ValidHoldersCount do
+    if SummaryHolderInfoTable[ValidHolders[i]].subvehicleinfo.valid == true then
+        local positiveDroneSize = SummaryHolderInfoTable[ValidHolders[i]].subvehicleinfo.PositiveSize
+        local negativeDroneSize = SummaryHolderInfoTable[ValidHolders[i]].subvehicleinfo.NegativeSize
+
+        local Info = SummaryHolderInfoTable[ValidHolders[i]].subvehicleinfo
+
+        --separating xyz values from vectors
+        local positiveDroneSizeX = positiveDroneSize.x
+        local positiveDroneSizeY = positiveDroneSize.y
+        local negativeDroneSizeX = negativeDroneSize.x
+        local negativeDroneSizeY = negativeDroneSize.y
+
+        local height = positiveDroneSizeY - negativeDroneSizeY
+        local width = positiveDroneSizeX - negativeDroneSizeX
+
+        if height == 0 or width == 0 then
+            height = Defaultheight
+            width = Defaultwidth
+        end
+
+        DroneSizeTable[ValidHolders[i]] = {
+            height = height,
+            width = width
+        }
+    else
+        SummaryHolderInfoTable[ValidHolders[i]].invalid = true
+        DroneSizeTable[ValidHolders[i]] = {
+            height = Defaultheight,
+            width = Defaultwidth,
+            name = SummaryHolderInfoTable[ValidHolders[i]].subvehicleinfo.BlueprintName
+        }
+    end
+end
+
+-----------------------------------
+---MISSILE WARNINGS
+-----------------------------------
+MissileWarnings = {}
+
+local MissileCount = I:GetNumberOfWarnings()
+
+for i = 0, MissileCount - 1 do
+
+    local Warning = I:GetMissileWarning(i)
+
+    if Warning.Valid then
+        table.insert(MissileWarnings, Warning)
+    end
+
+end
+
+MaxInterceptors =
+    math.max(
+        1,
+        math.floor(
+            ValidHoldersCount * MissileDroneFraction
+        )
+    )
+
+-------------------------------------------------------
+-- WALL GENERATION
+-------------------------------------------------------
+if #TargetGroups > 0 then
+
+    for i=1, #TargetGroups do
+
+        if AssignedHolders[i] then
+
+            SortHolders(
+                AssignedHolders[i],
+                DroneSizeTable,
+                DroneSortType,
+                DroneSortOrder
+            )
+
+        end
+
+    end
+
+    DroneWallPositionsForTarget = {}
+
+    for i=1, #TargetGroups do
+        
+        local constructPosition = I:GetConstructPosition()
+
+        local Target = TargetGroups[i]
+
+        if Target then
+            local Aim = TargetGroups[i].Position
+            
+            local DefenseAxis = Aim - constructPosition
+                
+            -- creating plane perpendicular to DefenseAxis using vectorcross
+            local PlaneRight = NormalizeVector(VectorCross(DefenseAxis, Vector3(0,1,0)))
+            local PlaneUp = NormalizeVector(VectorCross(DefenseAxis, PlaneRight))
+
+            -- finding furthest holder from the target to calculate the wall position
+            FurthestHolderDistance = 0
+
+                for ii=1, ValidHoldersCount do
+                    local HolderPosition = SummaryHolderInfoTable[ValidHolders[ii]].subconstructinfo.LocalPosition
+                    -- Calculate Global position of holder with local position and construct position
+                    -- convert local position to global position
+                    local globalHolderPosition = constructPosition + (I:GetConstructForwardVector() * HolderPosition.z) +
+                        (I:GetConstructUpVector() * HolderPosition.y) +
+                        (I:GetConstructRightVector() * HolderPosition.x)
+                    -- Calculate distance from holder to target
+                    local temp = globalHolderPosition - Aim
+                    local distanceToTarget = math.sqrt(temp.x^2 + temp.y^2 + temp.z^2)
+
+                    if distanceToTarget > FurthestHolderDistance then
+                        FurthestHolderDistance = distanceToTarget
+                        FurthestHolderPosition = globalHolderPosition
+                    end
+
+
+                end
+                
+            WallCenter = FurthestHolderPosition + (NormalizeVector(DefenseAxis) * MaxHolderDistance) -- offset wall center X units towards the target
+
+            -------------------------------------------------------
+            -- CREATE FIRING HOLES
+            -------------------------------------------------------
+
+            InvalidPositions = {}
+
+
+            for i=1,#FireLanes do
+
+                local Weapon = FireLanes[i]
+
+
+                local Hit =
+                    RayPlaneIntersection(
+                        Weapon.GlobalPosition,
+                        Weapon.CurrentDirection,
+                        WallCenter,
+                        NormalizeVector(DefenseAxis)
+                        )
+
+
+                if Hit then
+
+                    local PlanePos =
+                        WorldToPlane(
+                            Hit,
+                            WallCenter,
+                            PlaneRight,
+                            PlaneUp
+                        )
+
+
+                    table.insert(
+                        InvalidPositions,
+                        {
+                            x = PlanePos.x,
+                            y = PlanePos.y,
+
+                            width = FiringlaneSize,
+                            height = FiringlaneSize
+                        }
+                    )
+
+                end
+
+            end
+
+            -------------------------------------------------------
+            -- DRONE POSITION GENERATION
+            -------------------------------------------------------
+
+            TIKTAKTOE = {}
+
+            local Placed = {}
+
+            local DroneCount =
+                math.min(
+                    TargetMetaTable[i].numHoldersAssigned,
+                    #AssignedHolders[i]
+                )
+
+            for DroneIndex=1,DroneCount do
+
+                local HolderID =
+                    AssignedHolders[i][DroneIndex]
+
+                local DroneSize =
+                {
+                    width =
+                        DroneSizeTable[HolderID].width,
+
+                    height =
+                        DroneSizeTable[HolderID].height
+                }
+
+                local BestX = nil
+                local BestY = nil
+
+                ------------------------------------------------
+                -- GRID SEARCH
+                ------------------------------------------------
+
+                local Columns = GridColumns
+                local Rows = GridRows
+
+                local SpacingX =
+                    DroneSize.width + DroneGap
+
+                local SpacingY =
+                    DroneSize.height + DroneGap
+
+
+                local GridIndex = DroneIndex - 1
+
+                local CenterColumn = math.floor(Columns/2)
+                local CenterRow = math.floor(Rows/2)
+
+                local PlacementOrder = {}
+
+                local CenterX = (Columns - 1) / 2
+                local CenterY = (Rows - 1) / 2
+
+                for Row = 0, Rows-1 do
+                    for Column = 0, Columns-1 do
+
+                        local dx = Column - CenterX
+                        local dy = Row - CenterY
+
+                        table.insert(
+                            PlacementOrder,
+                            {
+                                column = Column,
+                                row = Row,
+                                distance = dx*dx + dy*dy
+                            }
+                        )
+
+                    end
+                end
+
+                table.sort(
+                    PlacementOrder,
+                    function(a,b)
+                        return a.distance < b.distance
+                    end
+                )
+
+
+                local Cell = PlacementOrder[DroneIndex]
+
+                local Column = Cell.column
+                local Row = Cell.row
+
+
+                local x =
+                    (Column - (Columns-1)/2)
+                    * SpacingX
+
+
+                local y =
+                    (Row - (Rows-1)/2)
+                    * SpacingY
+
+
+                if not IsInvalidPosition(
+                        x,
+                        y,
+                        DroneSize.width,
+                        DroneSize.height,
+                        InvalidPositions
+                    )
+
+                and not IsOverlapping(
+                    x,
+                    y,
+                    DroneSize.width,
+                    DroneSize.height,
+                    Placed
+                )
+
+                then
+
+                    BestX = x
+                    BestY = y
+
+                else
+
+                    -- fallback if a firing hole blocks the position
+                    for Offset=1,DroneCount do
+
+                        local TestX =
+                            x + Offset*SpacingX
+
+                        local TestY =
+                            y
+
+                        if not IsInvalidPosition(
+                                TestX,
+                                TestY,
+                                DroneSize.width,
+                                DroneSize.height,
+                                InvalidPositions
+                            )
+
+                        and not IsOverlapping(
+                            TestX,
+                            TestY,
+                            DroneSize.width,
+                            DroneSize.height,
+                            Placed
+                        )
+
+                        then
+
+                            BestX = TestX
+                            BestY = TestY
+
+                            break
+
+                        end
+
+                    end
+
+                end
+
+                if BestX then
+
+                    local WorldPosition =
+                        WallCenter
+                        + PlaneRight*BestX
+                        + PlaneUp*BestY
+
+                    table.insert(
+                        TIKTAKTOE,
+                        WorldPosition
+                    )
+
+
+                    table.insert(
+                        Placed,
+                        {
+                            x=BestX,
+                            y=BestY,
+                            width=DroneSize.width,
+                            height=DroneSize.height
+                        }
+                    )
+
+                else
+                end
+
+            end
+
+            table.insert(
+                DroneWallPositionsForTarget,
+                TIKTAKTOE
+            )
+        end
+
+    end
+
+    -------------------------------------
+    ---MISSILE INTERCEPTION
+    -------------------------------------
+    NearbyMissiles = {}
+
+    for i=1,#MissileWarnings do
+
+        local Missile = MissileWarnings[i]
+
+        if Missile.Range < MissileInterceptRange and Missile.Range > MissileMinimumInterceptRange then
+            table.insert(NearbyMissiles, Missile)
+        end
+
+    end
+
+    -- Sort missiles by danger
+    table.sort(
+        NearbyMissiles,
+        function(a,b)
+            return a.Range < b.Range
+        end
+    )
+
+    -------------------------------------
+    -- CREATE LIST OF AVAILABLE DRONES
+    -------------------------------------
+
+    AvailableInterceptors = {}
+
+    for TargetIndex=1,#TargetGroups do
+
+        if AssignedHolders[TargetIndex] then
+
+            for i=1,#AssignedHolders[TargetIndex] do
+
+                local HolderID =
+                    AssignedHolders[TargetIndex][i]
+
+
+                table.insert(
+                    AvailableInterceptors,
+                    {
+                        HolderID = HolderID,
+                        TargetIndex = TargetIndex,
+                        WallIndex = i
+                    }
+                )
+
+            end
+
+        end
+
+    end
+        
+    -------------------------------------
+    -- ASSIGN MISSILES TO DRONES
+    -------------------------------------
+
+    DroneReserved = {}
+    InterceptorTargets = {}
+
+
+    while
+        #NearbyMissiles > 0
+        and
+        #DroneReserved < MaxInterceptors
+    do
+
+
+        local Missile =
+            table.remove(
+                NearbyMissiles,
+                1
+            )
+
+
+        local ClosestDrone = nil
+
+        local ClosestDistance = math.huge
+
+
+
+        -- search every free drone
+
+        for i=1,#AvailableInterceptors do
+
+
+            local Drone =
+                AvailableInterceptors[i]
+
+
+            local HolderInfo =
+                SummaryHolderInfoTable[
+                    Drone.HolderID
+                ]
+
+
+            local DronePosition =
+                HolderInfo.subconstructinfo.LocalPosition
+
+
+            local ConstructPosition =
+                I:GetConstructPosition()
+
+
+            local GlobalDronePosition =
+                ConstructPosition
+                +
+                I:GetConstructForwardVector()
+                *
+                DronePosition.z
+                +
+                I:GetConstructUpVector()
+                *
+                DronePosition.y
+                +
+                I:GetConstructRightVector()
+                *
+                DronePosition.x
+
+
+
+            local Distance =
+                DistanceSquared(
+                    GlobalDronePosition,
+                    Missile.Position
+                )
+
+
+
+            if Distance < ClosestDistance then
+
+                ClosestDistance = Distance
+                ClosestDrone = i
+
+            end
+
+        end
+
+
+
+        -- assign drone
+
+        if ClosestDrone then
+
+
+            local Drone =
+                AvailableInterceptors[
+                    ClosestDrone
+                ]
+
+
+            local Collision = false
+
+
+            local DroneRadius =
+                GetDroneCollisionRadius(
+                    Drone.HolderID
+                )
+
+
+            for i=1,#DroneReserved do
+
+                local OtherDrone =
+                    DroneReserved[i]
+
+
+                if OtherDrone.InterceptTarget then
+
+
+                    local OtherRadius =
+                        GetDroneCollisionRadius(
+                            OtherDrone.HolderID
+                        )
+
+
+                    if CheckDroneCollision(
+                        Missile.Position,
+                        DroneRadius,
+                        OtherDrone.InterceptTarget,
+                        OtherRadius
+                    )
+                    then
+
+                        Collision = true
+                        break
+
+                    end
+
+                end
+
+            end
+
+
+
+            if Collision == false then
+
+
+                Drone.InterceptTarget =
+                    Missile.Position
+
+
+                Drone.OriginalMissile =
+                    Missile
+                
+                InterceptorTargets[
+                    Drone.HolderID
+                ]
+                =
+                Missile.Position
+
+
+                table.insert(
+                    DroneReserved,
+                    Drone
+                )
+
+
+            else
+
+                -- another drone already covers this position
+                Missile.AlreadyCovered = true
+
+            end
+
+
+        else
+
+            break
+
+        end
+
+
+    end
+
+    -------------------------------------
+    -- APPLY MISSILE INTERCEPT POSITIONS
+    --------------------------------------
+    
+    for i=1,#DroneReserved do
+        local Drone = DroneReserved[i]
+        if Drone.OriginalMissile then
+            local missilePos = Drone.InterceptTarget
+            local holderID = Drone.HolderID
+        end
+    end
+
+    ValidInterceptorPositions = {}
+
+    for i=1,#DroneReserved do
+
+        local Drone =
+            DroneReserved[i]
+
+        if DroneWallPositionsForTarget[Drone.TargetIndex] then
+            DroneWallPositionsForTarget[
+                Drone.TargetIndex
+            ]
+            [
+                Drone.WallIndex
+            ]
+            =
+            Drone.InterceptTarget
+        end
+
+
+    end
+
+    -------------------------------------------------------
+    -- DRONE AIMING AND ORIENTATION
+    -------------------------------------------------------
+    for i=1, #TargetGroups do
+
+        local Target = TargetGroups[i]
+
+        if Target then
+        
+            for ii=1, #AssignedHolders[i] do
+
+                local HolderID =
+                    AssignedHolders[i][ii]
+                
+                local IsInterceptor = false
+
+                for j=1,#DroneReserved do
+
+                    if DroneReserved[j].HolderID == HolderID then
+
+                        IsInterceptor = true
+                        break
+
+                    end
+
+                end
+
+                local DronePosition =
+                    DroneWallPositionsForTarget[i][ii]
+                
+                if DronePosition then
+                    
+                    -- drone forward and drone up need to be created from the weaponinfo of the holder. WeaponInfo.CurrentDirection will give a 3d vector orientation
+                    local WeaponIndex =
+                        InitHolderInfoTable[HolderID].weaponIndex
+
+                    local WeaponInfo =
+                        I:GetWeaponInfo(WeaponIndex)
+
+                    local DroneForward =
+                        NormalizeVector(WeaponInfo.CurrentDirection)
+                    -- setting the holder position requires the distance from the holder to the plane,
+                    -- we orient the holder towards the plane by orientating its weapon via I:AimWeaponInDirection(weaponIndex, x,y,z, weaponSlot)
+                    -- we then need to correct the angle of the subvehicle (held by the holder) to be perpendicular to the plane.
+                    -- the azimuth and elevation options on the holder (7) are used to correct the angle of the subvehicle to be perpendicular to the plane.
+                    -- we still need to convert local to global coordinates.
+
+                    local HolderPosition = SummaryHolderInfoTable[HolderID].subconstructinfo.LocalPosition
+                    
+                    local GlobalHolderPosition = I:GetConstructPosition() + (I:GetConstructForwardVector() * HolderPosition.z) +
+                            (I:GetConstructUpVector() * HolderPosition.y) +
+                            (I:GetConstructRightVector() * HolderPosition.x)
+                    
+                    local temp = DronePosition - GlobalHolderPosition
+                    local holdDistance = math.sqrt(temp.x^2 + temp.y^2 + temp.z^2)
+
+                    if holdDistance > 100 then
+                        holdDistance = 100
+                    end
+
+                    local constructPosition = I:GetConstructPosition()
+                    
+                    local Aim = TargetGroups[i].Position
+
+                    if IsInterceptor then
+                        HoldAzimuth = 0
+                        HoldElevation = 0
+                    else
+                        local DefenseAxis = Aim - DronePosition
+
+                        local DefenseNormal =
+                            NormalizeVector(DefenseAxis)
+
+                        local ConstructUp =
+                            I:GetConstructUpVector()
+
+                        
+
+                        local CrossDirection =
+                            VectorCross(
+                                DroneForward,
+                                DefenseNormal
+                            )
+
+                        HoldAzimuth =
+                            math.deg(
+                                math.asin(
+                                    VectorDot(
+                                        ConstructUp,
+                                        CrossDirection
+                                    )
+                                )
+                            )
+
+
+                        local CurrentDirection =
+                            NormalizeVector(
+                                WeaponInfo.CurrentDirection
+                            )
+                        
+                        
+
+                        local CurrentVertical =
+                            math.asin(CurrentDirection.y)
+
+
+                        local DesiredVertical =
+                            math.asin(DefenseNormal.y)
+
+
+                        HoldElevation =
+                            -math.deg(
+                                DesiredVertical - CurrentVertical
+                            )
+                    end
+
+                    I:Component_SetFloatLogic_3(7, HolderID, 0, holdDistance, 1, HoldAzimuth, 2, HoldElevation)
+
+                    local weaponIndex = InitHolderInfoTable[HolderID].weaponIndex
+                    local weaponSlot = 0 -- assuming the weapon slot is 0, adjust if necessary
+
+                    local WeaponPos =
+                        WeaponInfo.GlobalPosition
+
+                    local AimTarget =
+                        DroneWallPositionsForTarget[i][ii]
+
+
+                    if InterceptorTargets[HolderID] then
+
+                        AimTarget =
+                            InterceptorTargets[HolderID]
+
+                    end
+
+
+                    local AimDir =
+                        NormalizeVector(
+                            AimTarget - WeaponPos
+                        )
+
+                    local x = AimDir.x
+                    local y = AimDir.y
+                    local z = AimDir.z
+
+                    I:AimWeaponInDirection(weaponIndex, x,y,z, weaponSlot)
+                end
+                
+            end
+        end
+    end
+end
+
+----------------------------------------------
+---RETURN HOLDERS TO INIT POSITION IF NO TARGET
+----------------------------------------------
+
+if LastDoneOnce ~= TargetCount then
+    
+    DoneOnce = false
+
+end
+
+if TargetCount == 0 and DoneOnce == false then
+
+    LastDoneOnce = TargetCount
+
+    DoneOnce = true
+
+    for i=0, ValidHoldersCount-1 do
+
+        if InitHolderInfoTable[i].invalid == false then
+
+            local HolderID = i
+
+            local holdDistance = InitHolderInfoTable[i].holdDistance
+
+            local holdAzimuth = InitHolderInfoTable[i].holdAzimuth
+
+            local holdElevation = InitHolderInfoTable[i].holdElevation
+
+            I:Component_SetFloatLogic_3(7, HolderID, 0, holdDistance, 1, holdAzimuth, 2, holdElevation)
+        end
+    end
+
+end
+
+end
